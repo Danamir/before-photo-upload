@@ -12,13 +12,16 @@ A Python toolkit for managing and organizing image files, featuring intelligent 
 - Persistent index with compression for fast subsequent searches
 - Support for multiple formats: PNG, JPG, JPEG, GIF, BMP, HEIC, HEIF, WebP, TIFF
 
-### 2. **Intelligent File Renaming** (`handle_files.py`)
+### 2. **Intelligent File Handling** (`handle_files.py`)
 - Extracts datetime from **EXIF metadata** (capture time)
 - Falls back to **filename parsing** if EXIF unavailable
 - Uses **file creation time** as last resort
 - Customizable date format for output filenames
-- Automatic duplicate handling with counter suffixes
+- Automatic filename duplicate handling with counter suffixes
 - Dry-run mode to preview changes before applying
+- Resize on short-side or long-side dimensions
+- Convert to selected format, only when necessary
+- Copy EXIF data to converted files
 - Support for multiple formats: PNG, JPG, JPEG, GIF, BMP, HEIC, HEIF, WebP, TIFF
 
 ## Installation
@@ -71,18 +74,28 @@ Options:
 - **11-15**: Recognizably similar
 - **16+**: Increasingly different
 
-### Renaming Images by Capture Date
+### Handle Input Images
+
+**Note:** Renaming is now optional and controlled by the `--rename` flag. Without this flag, images will keep their original filenames (useful when only converting formats or resizing).
 
 #### Options
 ```
 Arguments:
-  DIRECTORY             Path to directory containing images
+  DIRECTORY                    Path to directory containing images
 
 Options:
-  --date-format <format>  Date format for renaming [default: %Y%m%d_%H%M%S]
-  -d --dry-run            Show what would be renamed without making changes
-  -v --verbose            Display verbose output including skipped files
-  -h --help               Show this help message and exit
+  --date-format <format>       Date format for renaming [default: %Y%m%d_%H%M%S]
+  --rename                     Enable file renaming based on date info [default: False]
+  --convert                    Enable file conversion [default: False]
+  --convert-format <format>    Output image format (jpg, png, webp, etc.) [default: jpg]
+  --out <folder>               Output folder, created if not existing [default: out]
+  --quality <quality>          JPEG/WebP compression quality (1-100) [default: 85]
+  --short-side <pixels>        Resize to this short-side dimension, keep aspect ratio
+  --long-side <pixels>         Resize to this long-side dimension, keep aspect ratio
+  --pool-size <size>           Number of parallel workers for processing [default: 5]
+  -d --dry-run                 Show what would be renamed/converted without making changes
+  -v --verbose                 Display verbose output including skipped files
+  -h --help                    Show this help message and exit
 ```
 
 #### Date Format Examples
