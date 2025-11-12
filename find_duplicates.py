@@ -174,6 +174,22 @@ class ImageHashIndex:
         elif hash_func == imagehash.whash:
             self.hash_func_name = 'whash'
     
+    def _find_existing_hash(self, img_hash):
+        """
+        Find an existing hash object in hash_to_files that equals img_hash.
+        This is needed because ImageHash objects with same value are different objects.
+
+        Args:
+            img_hash: ImageHash object to search for
+
+        Returns:
+            Existing ImageHash object if found, otherwise img_hash
+        """
+        for existing_hash in self.hash_to_files.keys():
+            if existing_hash == img_hash:
+                return existing_hash
+        return img_hash
+
     def add_image(self, filepath):
         """
         Add an image to the index.
@@ -199,7 +215,7 @@ class ImageHashIndex:
             import numpy as np
             hash_hex = temp_hash.hash.tobytes().hex()
             hash_bytes = bytes.fromhex(hash_hex)
-            hash_array = np.frombuffer(hash_bytes, dtype=np.uint64)
+            hash_array = np.frombuffer(hash_bytes, dtype=np.uint8).reshape(temp_hash.hash.shape)
             img_hash = imagehash.ImageHash(hash_array)
             
             # Remove old entry if file was modified
@@ -210,11 +226,16 @@ class ImageHashIndex:
                         if not self.hash_to_files[old_hash]:
                             del self.hash_to_files[old_hash]
             
-            # Add to BK-tree
+            # Add to BK-tree (may skip if hash already exists, which is fine)
             self.bktree.add(img_hash)
-            
-            # Map hash to file (multiple files can have same hash)
-            self.hash_to_files[img_hash].append(filepath)
+
+            # Find existing hash object to use as key (important for hash equality)
+            hash_key = self._find_existing_hash(img_hash)
+
+            # Always map hash to file (even if hash already exists in tree)
+            # Multiple files can have the same hash (crops, resizes, etc.)
+            if filepath not in self.hash_to_files[hash_key]:
+                self.hash_to_files[hash_key].append(filepath)
             self.file_mtimes[filepath] = mtime
             
             return True
@@ -267,7 +288,8 @@ class ImageHashIndex:
                         if success:
                             # Reconstruct hash object same way as load_index does
                             hash_bytes = bytes.fromhex(hash_hex)
-                            hash_array = np.frombuffer(hash_bytes, dtype=np.uint64)
+                            # phash produces 8x8 array of uint8
+                            hash_array = np.frombuffer(hash_bytes, dtype=np.uint8).reshape((8, 8))
                             img_hash = imagehash.ImageHash(hash_array)
 
                             # Remove old entry if file was modified
@@ -278,11 +300,16 @@ class ImageHashIndex:
                                         if not self.hash_to_files[old_hash]:
                                             del self.hash_to_files[old_hash]
 
-                            # Add to BK-tree first (sequential - thread safe)
+                            # Add to BK-tree (may skip if hash already exists, which is fine)
                             self.bktree.add(img_hash)
 
-                            # Always map hash to file
-                            self.hash_to_files[img_hash].append(filepath)
+                            # Find existing hash object to use as key (important for hash equality)
+                            hash_key = self._find_existing_hash(img_hash)
+
+                            # Always map hash to file (even if hash already exists in tree)
+                            # Multiple files can have the same hash (crops, resizes, etc.)
+                            if filepath not in self.hash_to_files[hash_key]:
+                                self.hash_to_files[hash_key].append(filepath)
                             self.file_mtimes[filepath] = mtime
                             count += 1
 
@@ -385,7 +412,12 @@ class ImageHashIndex:
             # Find all similar hashes
             similar_hashes = self.bktree.search(img_hash, threshold)
             
-            if len(similar_hashes) > 1:
+            # Create a group if:
+            # 1. Multiple hashes are similar (len(similar_hashes) > 1), OR
+            # 2. Single hash maps to multiple files (exact duplicates with same hash)
+            total_files = sum(len(self.hash_to_files[h]) for h, _ in similar_hashes)
+
+            if len(similar_hashes) > 1 or total_files > 1:
                 group = []
                 for similar_hash, distance in similar_hashes:
                     processed_hashes.add(similar_hash)
@@ -447,7 +479,8 @@ class ImageHashIndex:
                 # Recreate hash object from hex bytes
                 import numpy as np
                 hash_bytes = bytes.fromhex(hex_str)
-                hash_array = np.frombuffer(hash_bytes, dtype=np.uint64)
+                # phash produces 8x8 array of uint8
+                hash_array = np.frombuffer(hash_bytes, dtype=np.uint8).reshape((8, 8))
                 img_hash = imagehash.ImageHash(hash_array)
                 self.hash_to_files[img_hash] = files
                 # Add to BK-tree
@@ -455,7 +488,23 @@ class ImageHashIndex:
             
             print(f"Index loaded from {os.path.basename(self.index_file)}")
             return True
-        except (zipfile.BadZipFile, pickle.UnpicklingError, EOFError, ValueError, KeyError) as e:
+        except ValueError as e:
+            # Handle shape mismatch or other value errors - likely old format
+            if "reshape" in str(e) or "shape" in str(e).lower():
+                print(f"Index format incompatible (old version), will rebuild from scratch")
+                # Clear file mtimes to force full rebuild
+                self.file_mtimes = {}
+                self.hash_to_files = defaultdict(list)
+                # Remove old index file
+                try:
+                    os.remove(self.index_file)
+                except:
+                    pass
+                return False
+            else:
+                print(f"Error loading index: {e}")
+                return False
+        except (zipfile.BadZipFile, pickle.UnpicklingError, EOFError, KeyError) as e:
             print(f"Index file corrupted, will rebuild: {e}")
             # Remove corrupted index file
             try:
@@ -490,14 +539,12 @@ if __name__ == "__main__":
         if count > 0 or (index_loaded and index.bktree.size == 0):
             print(f"Processed {count} new/updated images")
             print(f"BK-tree size: {index.bktree.size} unique hashes")
-            print(f"Hash mappings: {len(index.hash_to_files)} unique hashes")
 
             # Save index
             index.save_index()
         elif index_loaded:
             print("Index is up to date")
             print(f"BK-tree size: {index.bktree.size} unique hashes")
-            print(f"Hash mappings: {len(index.hash_to_files)} unique hashes")
         
         # Always run duplicate detection after building/loading index
         if image:
