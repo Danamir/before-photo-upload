@@ -17,6 +17,7 @@ Arguments:
 
 Options:
   --date-format <format>       Date format for renaming [default: %Y%m%d_%H%M%S]
+  --rename                     Enable file renaming based on date info [default: False]
   --convert                    Enable file conversion [default: False]
   --convert-format <format>    Output image format (jpg, png, webp, etc.) [default: jpg]
   --out <folder>               Output folder, created if not existing [default: out]
@@ -79,15 +80,16 @@ class ImageFileHandler:
     
     IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.heic', '.heif', '.webp', '.tiff')
     
-    def __init__(self, date_format='%Y%m%d_%H%M%S', verbose=False, convert=False, 
+    def __init__(self, date_format='%Y%m%d_%H%M%S', verbose=False, rename=False, convert=False, 
                  convert_format='jpg', output_folder='out', quality=85, 
                  short_side=None, long_side=None, pool_size=5):
         """
         Initialize handler.
-        
+
         Args:
             date_format: Format string for output datetime
             verbose: If True, display verbose output including skipped files
+            rename: If True, rename files based on date info
             convert: If True, convert files
             convert_format: Output image format (jpg, png, webp, etc.)
             output_folder: Output folder for converted files
@@ -98,6 +100,7 @@ class ImageFileHandler:
         """
         self.date_format = date_format
         self.verbose = verbose
+        self.rename = rename
         self.convert = convert or short_side is not None or long_side is not None
         self.convert_format = convert_format.lower()
         self.output_folder = output_folder
@@ -254,6 +257,25 @@ class ImageFileHandler:
         Returns:
             New filename (with extension)
         """
+        # If rename is disabled, keep original name but change extension if converting
+        if not self.rename:
+            if self.convert:
+                base = os.path.splitext(filename)[0]
+                new_name = base + '.' + self.convert_format
+            else:
+                new_name = filename
+
+            # Handle duplicates by appending counter
+            if new_name in self.duplicates:
+                self.duplicates[new_name] += 1
+                base, ext = os.path.splitext(new_name)
+                new_name = f"{base}_{self.duplicates[new_name]:03d}{ext}"
+            else:
+                self.duplicates[new_name] = 0
+
+            return new_name
+
+        # Rename based on date info
         ext = os.path.splitext(filename)[1]
         
         # Use converted format if conversion is enabled
@@ -683,6 +705,7 @@ def main():
     date_format = args['--date-format']
     dry_run = args['--dry-run']
     verbose = args['--verbose']
+    rename = args['--rename']
     convert = args['--convert']
     convert_format = args['--convert-format']
     output_folder = args['--out']
@@ -690,15 +713,16 @@ def main():
     short_side = args['--short-side']
     long_side = args['--long-side']
     pool_size = args['--pool-size']
-    
+
     # Validate exclusive options
     if short_side and long_side:
         print("Error: --short-side and --long-side are mutually exclusive")
         return
-    
+
     handler = ImageFileHandler(
         date_format=date_format,
         verbose=verbose,
+        rename=rename,
         convert=convert,
         convert_format=convert_format,
         output_folder=output_folder,
