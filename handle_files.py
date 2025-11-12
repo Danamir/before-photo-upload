@@ -331,6 +331,11 @@ class ImageFileHandler:
         try:
             image = Image.open(filepath)
             
+            # Preserve EXIF data
+            exif_data = None
+            if hasattr(image, 'info') and 'exif' in image.info:
+                exif_data = image.info['exif']
+            
             # Get original dimensions
             original_width, original_height = image.size
             original_dims = (original_width, original_height)
@@ -358,8 +363,14 @@ class ImageFileHandler:
                     background.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
                     image = background
                 save_kwargs['quality'] = self.quality
+                # Add EXIF data to save kwargs if available
+                if exif_data:
+                    save_kwargs['exif'] = exif_data
             elif self.convert_format == 'webp':
                 save_kwargs['quality'] = self.quality
+                # Add EXIF data to save kwargs if available
+                if exif_data:
+                    save_kwargs['exif'] = exif_data
             
             # Check if conversion is worthwhile
             original_format = image.format or os.path.splitext(filepath)[1][1:].lower()
