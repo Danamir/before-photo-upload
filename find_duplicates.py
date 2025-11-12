@@ -192,7 +192,15 @@ class ImageHashIndex:
                 return False
             
             with Image.open(filepath) as img:
-                img_hash = self.hash_func(img)
+                temp_hash = self.hash_func(img)
+
+            # Serialize and deserialize to ensure consistent hash format
+            # This matches what happens in parallel processing and save/load
+            import numpy as np
+            hash_hex = temp_hash.hash.tobytes().hex()
+            hash_bytes = bytes.fromhex(hash_hex)
+            hash_array = np.frombuffer(hash_bytes, dtype=np.uint64)
+            img_hash = imagehash.ImageHash(hash_array)
             
             # Remove old entry if file was modified
             if filepath in self.file_mtimes:
