@@ -3,7 +3,7 @@ Image duplicate detection using perceptual hashing and BK-tree
 for efficient nearest neighbor search.
 
 Usage:
-  find_duplicates.py [-t <threshold>] [--pool-size <size>] [-h] DIRECTORY
+  find_duplicates.py [-t <threshold>] [--pool-size <size>] [--rename] [-h] DIRECTORY
   find_duplicates.py [-t <threshold>] [--pool-size <size>] [-h] DIRECTORY IMAGE
   find_duplicates.py -h | --help
 
@@ -14,6 +14,7 @@ Arguments:
 Options:
   -t --threshold <threshold>  Maximum Hamming distance [default: 5]
   --pool-size <size>      Number of parallel workers for hashing [default: 5]
+  --rename                Rename duplicate images with group prefix (e.g., group-01-image.jpg)
   -h --help               Show this help message and exit
 
 Threshold Guide:
@@ -517,6 +518,57 @@ class ImageHashIndex:
             return False
 
 
+def rename_duplicate_groups(duplicate_groups, directory):
+    """
+    Rename images in duplicate groups with group prefix.
+    
+    Args:
+        duplicate_groups: List of groups from find_all_duplicate_groups()
+        directory: Base directory containing images
+        
+    Returns:
+        Number of files renamed
+    """
+    renamed_count = 0
+    errors = []
+    
+    for group_num, group in enumerate(duplicate_groups, 1):
+        group_prefix = f"group-{group_num:02d}-"
+        
+        for filepath, img_hash, distance in group:
+            # Only rename files in the specified directory
+            if os.path.dirname(filepath) != directory:
+                continue
+            
+            filename = os.path.basename(filepath)
+            
+            # Skip if already has group prefix
+            if filename.startswith("group-"):
+                continue
+            
+            new_filename = group_prefix + filename
+            new_filepath = os.path.join(directory, new_filename)
+            
+            # Check if target filename already exists
+            if os.path.exists(new_filepath):
+                errors.append(f"Cannot rename {filename}: {new_filename} already exists")
+                continue
+            
+            try:
+                os.rename(filepath, new_filepath)
+                print(f"Renamed: {filename} -> {new_filename}")
+                renamed_count += 1
+            except Exception as e:
+                errors.append(f"Error renaming {filename}: {e}")
+    
+    if errors:
+        print("\nErrors encountered:")
+        for error in errors:
+            print(f"  - {error}")
+    
+    return renamed_count
+
+
 # Example usage
 if __name__ == "__main__":
     args = docopt(__doc__)
@@ -525,6 +577,7 @@ if __name__ == "__main__":
     image = args['IMAGE']
     threshold = int(args['--threshold'])
     pool_size = int(args['--pool-size'])
+    do_rename = args['--rename']
 
     # Create index with persistence
     index_file = os.path.join(directory, '.image_index.zip')
@@ -585,5 +638,13 @@ if __name__ == "__main__":
                 print(f"\nGroup {i} ({len(group)} images):")
                 for filepath, img_hash, distance in group:
                     print(f"  - {os.path.basename(filepath)} (distance: {distance})")
+            
+            # Rename files if --rename flag is set
+            if do_rename and duplicate_groups:
+                print("\n" + "="*60)
+                print("Renaming duplicate images...")
+                print("="*60)
+                renamed_count = rename_duplicate_groups(duplicate_groups, directory)
+                print(f"\nRenamed {renamed_count} files")
     else:
         print(f"Directory '{directory}' not found.")
