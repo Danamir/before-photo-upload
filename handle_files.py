@@ -23,6 +23,7 @@ Options:
   --quality <quality>          JPEG/WebP compression quality (1-100) [default: 85]
   --short-side <pixels>        Resize to this short-side dimension, keep aspect ratio
   --long-side <pixels>         Resize to this long-side dimension, keep aspect ratio
+  --pool-size <size>           Number of parallel workers for processing [default: 5]
   -d --dry-run                 Show what would be renamed/converted without making changes
   -v --verbose                 Display verbose output including skipped files
   -h --help                    Show this help message and exit
@@ -39,6 +40,7 @@ Date Format Examples:
 """
 
 import os
+from multiprocessing import Pool
 from datetime import datetime
 from pathlib import Path
 from docopt import docopt
@@ -47,6 +49,8 @@ from PIL.ExifTags import TAGS
 from pillow_heif import register_heif_opener
 import re
 from collections import defaultdict
+import uuid
+import shutil
 
 register_heif_opener()
 
@@ -77,7 +81,7 @@ class ImageFileHandler:
     
     def __init__(self, date_format='%Y%m%d_%H%M%S', verbose=False, convert=False, 
                  convert_format='jpg', output_folder='out', quality=85, 
-                 short_side=None, long_side=None):
+                 short_side=None, long_side=None, pool_size=5):
         """
         Initialize handler.
         
@@ -90,6 +94,7 @@ class ImageFileHandler:
             quality: Compression quality for JPEG/WebP (1-100)
             short_side: Resize to this short-side dimension (enables conversion)
             long_side: Resize to this long-side dimension (enables conversion)
+            pool_size: Number of parallel workers for processing
         """
         self.date_format = date_format
         self.verbose = verbose
@@ -99,6 +104,7 @@ class ImageFileHandler:
         self.quality = int(quality)
         self.short_side = int(short_side) if short_side else None
         self.long_side = int(long_side) if long_side else None
+        self.pool_size = int(pool_size)
         self.rename_map = {}  # Maps old name to new name
         self.duplicates = defaultdict(int)  # Track duplicate new names
     
@@ -316,10 +322,11 @@ class ImageFileHandler:
             original_size: Size of original file in bytes
             
         Returns:
-            Tuple of (success: bool, new_size: int, format_changed: bool, copied: bool, original_dims: tuple, new_dims: tuple)
+            Tuple of (success: bool, new_size: int, format_changed: bool, copied: bool, original_dims: tuple, new_dims: tuple, actual_output_path: str)
             copied: True if original was copied instead of converted
             original_dims: Tuple of (width, height) of original
             new_dims: Tuple of (width, height) of converted
+            actual_output_path: The actual path where the file was saved (may include counter suffix)
         """
         try:
             image = Image.open(filepath)
@@ -357,28 +364,32 @@ class ImageFileHandler:
             # Check if conversion is worthwhile
             original_format = image.format or os.path.splitext(filepath)[1][1:].lower()
             
-            # Save to temporary location first to check size
-            temp_path = output_path + '.tmp'
+            # Save to temporary location first to check size (with unique UID to avoid collisions)
+            temp_uid = str(uuid.uuid4())[:8]
+            temp_path = f"{output_path}.tmp.{temp_uid}"
             image.save(temp_path, format=format_name, **save_kwargs)
             new_size = os.path.getsize(temp_path)
+            
+            # Get unique output path (handle collisions)
+            final_output_path = self.get_unique_output_path(output_path)
             
             # Check if we should copy original instead
             format_changed = original_format.lower() != self.convert_format.lower()
             if not format_changed and original_size > 0:
                 size_reduction = (original_size - new_size) / original_size
                 if size_reduction < 0.10:  # Less than 10% smaller
-                    # Copy original instead
-                    os.replace(filepath, output_path)
+                    # Copy original instead (don't delete source)
+                    shutil.copy2(filepath, final_output_path)
                     os.remove(temp_path)
-                    return True, original_size, False, True, original_dims, original_dims
+                    return True, original_size, False, True, original_dims, original_dims, final_output_path
             
             # Move temp file to final location
-            os.replace(temp_path, output_path)
-            return True, new_size, format_changed, False, original_dims, new_dims
+            os.replace(temp_path, final_output_path)
+            return True, new_size, format_changed, False, original_dims, new_dims, final_output_path
         
         except Exception as e:
             print(f"  Conversion error: {e}")
-            return False, 0, False, False, (0, 0), (0, 0)
+            return False, 0, False, False, (0, 0), (0, 0), output_path
     
     def get_file_size_info(self, filepath_or_size):
         """
@@ -407,9 +418,154 @@ class ImageFileHandler:
         except:
             return 0, "unknown"
     
+    def get_unique_output_path(self, output_file_path):
+        """
+        Get a unique output file path by appending a counter if the file already exists.
+        
+        Args:
+            output_file_path: The desired output file path
+            
+        Returns:
+            A unique file path that doesn't exist yet
+        """
+        if not os.path.exists(output_file_path):
+            return output_file_path
+        
+        # File exists, append a counter
+        base, ext = os.path.splitext(output_file_path)
+        counter = 1
+        while True:
+            new_path = f"{base}_{counter:03d}{ext}"
+            if not os.path.exists(new_path):
+                return new_path
+            counter += 1
+    
+    def process_file(self, filename, directory, output_path, dry_run):
+        """
+        Process a single image file (called by starmap for parallel processing).
+        
+        Args:
+            filename: Name of the file to process
+            directory: Source directory path
+            output_path: Output directory path
+            dry_run: If True, only show what would be done
+            
+        Returns:
+            Tuple of (filename, new_filename, status, original_size, new_size, orig_dims, new_dims, output_lines)
+        """
+        filepath = os.path.join(directory, filename)
+        original_size, original_size_str = self.get_file_size_info(filepath)
+        output_lines = []
+        orig_dims = (0, 0)
+        new_dims = (0, 0)
+        
+        try:
+            new_filename = self.generate_new_filename(filepath, filename)
+            
+            if self.convert:
+                output_file_path = os.path.join(output_path, new_filename)
+            else:
+                output_file_path = os.path.join(directory, new_filename)
+            
+            if new_filename == filename and not self.convert:
+                status = "NO_CHANGE"
+                if self.verbose:
+                    output_lines.append(f"SKIP: {filename}")
+                return (filename, new_filename, status, original_size, original_size, orig_dims, new_dims, output_lines)
+            else:
+                if not dry_run:
+                    if self.convert:
+                        success, new_size, format_changed, copied, orig_dims, new_dims, final_output_path = self.convert_image(filepath, output_file_path, original_size)
+                        if success:
+                            # Update new_filename to reflect actual output path (may include counter)
+                            new_filename = os.path.basename(final_output_path)
+                            _, new_size_str = self.get_file_size_info(final_output_path)
+                            status = "CONVERTED" if format_changed or not copied else "COPIED"
+                            output_lines.append(f"{status}: {filename}")
+                            output_lines.append(f"     -> {new_filename}")
+                            output_lines.append(f"        {original_size_str} -> {new_size_str}")
+                            if orig_dims != new_dims:
+                                output_lines.append(f"        {orig_dims[0]}x{orig_dims[1]} -> {new_dims[0]}x{new_dims[1]}")
+                            
+                            return (filename, new_filename, status, original_size, new_size, orig_dims, new_dims, output_lines)
+                        else:
+                            status = "ERROR"
+                            output_lines.append(f"ERROR: Failed to convert {filename}")
+                            return (filename, new_filename, status, original_size, original_size, orig_dims, new_dims, output_lines)
+                    else:
+                        # Get unique path for rename to avoid collisions
+                        final_output_path = self.get_unique_output_path(output_file_path)
+                        os.rename(filepath, final_output_path)
+                        status = "RENAMED"
+                        new_size = original_size
+                        # Update new_filename to reflect actual output path
+                        new_filename = os.path.basename(final_output_path)
+                        output_lines.append(f"RENAME: {filename}")
+                        output_lines.append(f"     -> {new_filename}")
+                        
+                        return (filename, new_filename, status, original_size, new_size, orig_dims, new_dims, output_lines)
+                else:
+                    # Dry-run: simulate conversion to get new size
+                    new_size = original_size
+                    status = "DRY_RUN"
+                    new_size_str = original_size_str
+                    resolution_str = ""
+                    
+                    if self.convert:
+                        try:
+                            image = Image.open(filepath)
+                            original_width, original_height = image.size
+                            orig_dims = (original_width, original_height)
+                            new_width, new_height = self.get_resized_dimensions(original_width, original_height)
+                            new_dims = (new_width, new_height)
+                            
+                            if new_width != original_width or new_height != original_height:
+                                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                            
+                            save_kwargs = {}
+                            
+                            # Normalize format name for PIL
+                            format_name = self.convert_format.upper()
+                            if format_name == 'JPG':
+                                format_name = 'JPEG'
+                            
+                            if self.convert_format in ('jpg', 'jpeg'):
+                                if image.mode in ('RGBA', 'LA', 'P'):
+                                    background = Image.new('RGB', image.size, (255, 255, 255))
+                                    background.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
+                                    image = background
+                                save_kwargs['quality'] = self.quality
+                            elif self.convert_format == 'webp':
+                                save_kwargs['quality'] = self.quality
+                            
+                            temp_uid = str(uuid.uuid4())[:8]
+                            temp_path = f"{filepath}.dryrun_tmp.{temp_uid}"
+                            image.save(temp_path, format=format_name, **save_kwargs)
+                            new_size = os.path.getsize(temp_path)
+                            _, new_size_str = self.get_file_size_info(temp_path)
+                            os.remove(temp_path)
+                            
+                            # Display resolution info
+                            if new_width != original_width or new_height != original_height:
+                                resolution_str = f"\n       {original_width}x{original_height} -> {new_width}x{new_height}"
+                        except:
+                            pass
+                    
+                    output_lines.append(f"[DRY-RUN] {filename}")
+                    output_lines.append(f"       -> {new_filename}")
+                    if self.convert:
+                        output_lines.append(f"       {original_size_str} -> {new_size_str} (.{self.convert_format}){resolution_str}")
+                    
+                    return (filename, new_filename, status, original_size, new_size, orig_dims, new_dims, output_lines)
+        
+        except Exception as e:
+            status = "ERROR"
+            output_lines.append(f"ERROR: {filename} - {str(e)}")
+            return (filename, filename, status, original_size, original_size, orig_dims, new_dims, output_lines)
+    
     def process_directory(self, directory, dry_run=False):
         """
-        Process all images in directory and plan/perform renames and conversions.
+        Process all images in directory and plan/perform renames and conversions using parallel processing.
         
         Args:
             directory: Path to directory
@@ -435,7 +591,7 @@ class ImageFileHandler:
         
         results = []
         files_in_dir = os.listdir(directory)
-        image_files = [f for f in files_in_dir if f.lower().endswith(self.IMAGE_EXTENSIONS)]
+        image_files = sorted([f for f in files_in_dir if f.lower().endswith(self.IMAGE_EXTENSIONS)])
         
         if not image_files:
             print(f"No image files found in {directory}")
@@ -443,106 +599,24 @@ class ImageFileHandler:
         
         print(f"Found {len(image_files)} image(s) to process.\n")
         
-        for filename in sorted(image_files):
-            filepath = os.path.join(directory, filename)
-            original_size, original_size_str = self.get_file_size_info(filepath)
+        # Use starmap for parallel processing
+        with Pool(self.pool_size) as pool:
+            # Create arguments for starmap
+            args = [(filename, directory, output_path, dry_run) for filename in image_files]
             
-            try:
-                new_filename = self.generate_new_filename(filepath, filename)
-                
-                if self.convert:
-                    output_file_path = os.path.join(output_path, new_filename)
-                else:
-                    output_file_path = os.path.join(directory, new_filename)
-                
-                if new_filename == filename and not self.convert:
-                    status = "NO_CHANGE"
-                    if self.verbose:
-                        print(f"SKIP: {filename}")
-                    results.append((filename, new_filename, status, original_size, original_size))
-                else:
-                    if not dry_run:
-                        # Check if target already exists
-                        if os.path.exists(output_file_path) and output_file_path != filepath:
-                            status = "ERROR_EXISTS"
-                            print(f"ERROR: {filename} -> {new_filename} (target already exists)")
-                            results.append((filename, new_filename, status, original_size, original_size))
-                        else:
-                            if self.convert:
-                                success, new_size, format_changed, copied, orig_dims, new_dims = self.convert_image(filepath, output_file_path, original_size)
-                                if success:
-                                    new_size_str, _ = self.get_file_size_info(output_file_path)
-                                    _, new_size_str = self.get_file_size_info(output_file_path)
-                                    status = "CONVERTED" if format_changed or not copied else "COPIED"
-                                    print(f"{status}: {filename}")
-                                    print(f"     -> {new_filename}")
-                                    print(f"        {original_size_str} -> {new_size_str}")
-                                    if orig_dims != new_dims:
-                                        print(f"        {orig_dims[0]}x{orig_dims[1]} -> {new_dims[0]}x{new_dims[1]}")
-                                    
-                                    results.append((filename, new_filename, status, original_size, new_size))
-                                else:
-                                    status = "ERROR"
-                                    print(f"ERROR: Failed to convert {filename}")
-                                    results.append((filename, new_filename, status, original_size, original_size))
-                                    continue
-                    else:
-                        # Dry-run: simulate conversion to get new size
-                        new_size = original_size
-                        status = "DRY_RUN"
-                        new_size_str = original_size_str
-                        
-                        if self.convert:
-                            try:
-                                image = Image.open(filepath)
-                                original_width, original_height = image.size
-                                new_width, new_height = self.get_resized_dimensions(original_width, original_height)
-                                
-                                if new_width != original_width or new_height != original_height:
-                                    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                                
-                                save_kwargs = {}
-                                
-                                # Normalize format name for PIL
-                                format_name = self.convert_format.upper()
-                                if format_name == 'JPG':
-                                    format_name = 'JPEG'
-                                
-                                if self.convert_format in ('jpg', 'jpeg'):
-                                    if image.mode in ('RGBA', 'LA', 'P'):
-                                        background = Image.new('RGB', image.size, (255, 255, 255))
-                                        background.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
-                                        image = background
-                                    save_kwargs['quality'] = self.quality
-                                elif self.convert_format == 'webp':
-                                    save_kwargs['quality'] = self.quality
-                                
-                                temp_path = filepath + '.dryrun_tmp'
-                                image.save(temp_path, format=format_name, **save_kwargs)
-                                new_size = os.path.getsize(temp_path)
-                                _, new_size_str = self.get_file_size_info(temp_path)
-                                os.remove(temp_path)
-                                
-                                # Display resolution info
-                                if new_width != original_width or new_height != original_height:
-                                    resolution_str = f"\n       {original_width}x{original_height} -> {new_width}x{new_height}"
-                                else:
-                                    resolution_str = ""
-                            except:
-                                resolution_str = ""
-                                pass
-                        
-                        print(f"[DRY-RUN] {filename}")
-                        print(f"       -> {new_filename}")
-                        if self.convert:
-                            print(f"       {original_size_str} -> {new_size_str} (.{self.convert_format}){resolution_str}")
-                        
-                        results.append((filename, new_filename, status, original_size, new_size))
+            # Use starmap to process files in parallel
+            pool_results = pool.starmap(self.process_file, args)
+        
+        # Process results and display output
+        for result in pool_results:
+            filename, new_filename, status, original_size, new_size, orig_dims, new_dims, output_lines = result
             
-            except Exception as e:
-                status = "ERROR"
-                print(f"ERROR: {filename} - {str(e)}")
-                results.append((filename, filename, status, original_size, original_size))
+            # Print output lines
+            for line in output_lines:
+                print(line)
+            
+            # Add to results list (without output_lines)
+            results.append((filename, new_filename, status, original_size, new_size))
         
         return results
     
@@ -604,6 +678,7 @@ def main():
     quality = args['--quality']
     short_side = args['--short-side']
     long_side = args['--long-side']
+    pool_size = args['--pool-size']
     
     # Validate exclusive options
     if short_side and long_side:
@@ -618,7 +693,8 @@ def main():
         output_folder=output_folder,
         quality=quality,
         short_side=short_side,
-        long_side=long_side
+        long_side=long_side,
+        pool_size=pool_size
     )
     
     if dry_run:
