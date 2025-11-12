@@ -551,12 +551,28 @@ if __name__ == "__main__":
             # Search for duplicates of a specific image
             if os.path.exists(image):
                 print(f"\n\nSearching for duplicates of {os.path.basename(image)}:")
-                results = index.find_duplicates(image, threshold=threshold)
-                if results:
-                    for filepath, distance in results:
+
+                # Find duplicates within threshold
+                duplicates = index.find_duplicates(image, threshold=threshold)
+                if duplicates:
+                    print(f"\nFound {len(duplicates)} duplicate(s) within threshold {threshold}:")
+                    for filepath, distance in duplicates:
                         print(f"  - {os.path.basename(filepath)} (distance: {distance})")
                 else:
-                    print("  No duplicates found.")
+                    print(f"\nNo duplicates found within threshold {threshold}.")
+
+                # Find 10 closest non-duplicate images (exclude those already in duplicates)
+                print(f"\n10 closest non-duplicate images:")
+                all_similar = index.find_duplicates(image, threshold=64)  # Max possible distance for 8x8 hash
+                # Filter out duplicates (distance > threshold)
+                non_duplicates = [item for item in all_similar if item[1] > threshold]
+                closest_10 = non_duplicates[:10]
+
+                if closest_10:
+                    for filepath, distance in closest_10:
+                        print(f"  - {os.path.basename(filepath)} (distance: {distance})")
+                else:
+                    print("  No other similar images found.")
             else:
                 print(f"Image file '{image}' not found.")
         else:
