@@ -64,6 +64,7 @@ Arguments:
 
 Options:
   -t --threshold <threshold>  Maximum Hamming distance [default: 5]
+  --pool-size <size>      Number of parallel workers for hashing [default: 5]
   -h --help               Show this help message and exit
 ```
 
