@@ -3,8 +3,8 @@ Image duplicate detection using perceptual hashing and BK-tree
 for efficient nearest neighbor search.
 
 Usage:
-  find_duplicates.py [-t <threshold>] [-h] DIRECTORY
-  find_duplicates.py [-t <threshold>] [-h] DIRECTORY IMAGE
+  find_duplicates.py [-t <threshold>] [--pool-size <size>] [-h] DIRECTORY
+  find_duplicates.py [-t <threshold>] [--pool-size <size>] [-h] DIRECTORY IMAGE
   find_duplicates.py -h | --help
 
 Arguments:
@@ -13,6 +13,7 @@ Arguments:
 
 Options:
   -t --threshold <threshold>  Maximum Hamming distance [default: 5]
+  --pool-size <size>      Number of parallel workers for hashing [default: 5]
   -h --help               Show this help message and exit
 
 Threshold Guide:
@@ -33,8 +34,46 @@ import pickle
 import time
 import zipfile
 import io
+from multiprocessing import Pool
 
 register_heif_opener()
+
+
+def process_image_worker(filepath, hash_func_name='phash'):
+    """
+    Worker function for parallel image processing.
+
+    Args:
+        filepath: Path to image file
+        hash_func_name: Name of hash function to use
+
+    Returns:
+        Tuple of (filepath, hash_hex, mtime, success)
+    """
+    try:
+        mtime = os.path.getmtime(filepath)
+
+        # Get hash function by name
+        if hash_func_name == 'phash':
+            hash_func = imagehash.phash
+        elif hash_func_name == 'ahash':
+            hash_func = imagehash.average_hash
+        elif hash_func_name == 'dhash':
+            hash_func = imagehash.dhash
+        elif hash_func_name == 'whash':
+            hash_func = imagehash.whash
+        else:
+            hash_func = imagehash.phash  # Default fallback
+
+        with Image.open(filepath) as img:
+            img_hash = hash_func(img)
+
+        # Serialize same way as save_index does
+        hash_hex = img_hash.hash.tobytes().hex()
+
+        return (filepath, hash_hex, mtime, True)
+    except Exception as e:
+        return (filepath, None, None, False)
 
 
 class BKTree:
@@ -112,17 +151,28 @@ class ImageHashIndex:
     Index for fast image duplicate detection using pHash and BK-tree.
     """
     
-    def __init__(self, hash_func=None, index_file=None):
+    def __init__(self, hash_func=None, index_file=None, pool_size=5):
         """
         Args:
             hash_func: Hash function (default: imagehash.phash)
             index_file: Path to save/load index (optional)
+            pool_size: Number of parallel workers for image processing
         """
         self.hash_func = hash_func or imagehash.phash
         self.bktree = BKTree(distance_func=lambda h1, h2: h1 - h2)
         self.hash_to_files = defaultdict(list)
         self.file_mtimes = {}  # Track file modification times
         self.index_file = index_file
+        self.pool_size = int(pool_size)
+
+        # Map hash function to string name for multiprocessing
+        self.hash_func_name = 'phash'  # default
+        if hash_func == imagehash.average_hash:
+            self.hash_func_name = 'ahash'
+        elif hash_func == imagehash.dhash:
+            self.hash_func_name = 'dhash'
+        elif hash_func == imagehash.whash:
+            self.hash_func_name = 'whash'
     
     def add_image(self, filepath):
         """
@@ -166,23 +216,81 @@ class ImageHashIndex:
     
     def add_directory(self, directory, extensions=('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.heic', '.heif', '.webp', '.tiff')):
         """
-        Add all images from a directory.
-        
+        Add all images from a directory using parallel processing.
+
         Args:
             directory: Directory path
             extensions: Tuple of valid file extensions
-            
+
         Returns:
             Number of images added/updated
         """
         count = 0
-        for filename in os.listdir(directory):
-            if filename.lower().endswith(extensions):
-                filepath = os.path.join(directory, filename)
-                if self.add_image(filepath):
-                    count += 1
-                    if count % 100 == 0:
-                        print(f"Processed {count} new/updated images...")
+
+        # Use parallel processing if pool_size > 1
+        if self.pool_size > 1:
+            # Get all image files that need processing
+            files_to_process = []
+            for filename in os.listdir(directory):
+                if filename.lower().endswith(extensions):
+                    filepath = os.path.join(directory, filename)
+                    try:
+                        mtime = os.path.getmtime(filepath)
+                        # Only process if file is new or modified
+                        if filepath not in self.file_mtimes or self.file_mtimes[filepath] != mtime:
+                            files_to_process.append(filepath)
+                    except OSError:
+                        continue
+
+            if files_to_process:
+                print(f"Processing {len(files_to_process)} new/updated images with {self.pool_size} workers...")
+
+                # Use parallel processing
+                with Pool(self.pool_size) as pool:
+                    # Create arguments for starmap: (filepath, hash_func_name)
+                    args = [(filepath, self.hash_func_name) for filepath in files_to_process]
+
+                    # Process images in parallel
+                    results = pool.starmap(process_image_worker, args)
+
+                    # Process results sequentially (BK-tree is not thread-safe)
+                    import numpy as np
+                    for filepath, hash_hex, mtime, success in results:
+                        if success:
+                            # Reconstruct hash object same way as load_index does
+                            hash_bytes = bytes.fromhex(hash_hex)
+                            hash_array = np.frombuffer(hash_bytes, dtype=np.uint64)
+                            img_hash = imagehash.ImageHash(hash_array)
+
+                            # Remove old entry if file was modified
+                            if filepath in self.file_mtimes:
+                                for old_hash in list(self.hash_to_files.keys()):
+                                    if filepath in self.hash_to_files[old_hash]:
+                                        self.hash_to_files[old_hash].remove(filepath)
+                                        if not self.hash_to_files[old_hash]:
+                                            del self.hash_to_files[old_hash]
+
+                            # Add to BK-tree first (sequential - thread safe)
+                            self.bktree.add(img_hash)
+
+                            # Always map hash to file
+                            self.hash_to_files[img_hash].append(filepath)
+                            self.file_mtimes[filepath] = mtime
+                            count += 1
+
+                            if count % 100 == 0:
+                                print(f"Processed {count} new/updated images...")
+                        else:
+                            print(f"Error processing {filepath}")
+        else:
+            # Use sequential processing (original code)
+            for filename in os.listdir(directory):
+                if filename.lower().endswith(extensions):
+                    filepath = os.path.join(directory, filename)
+                    if self.add_image(filepath):
+                        count += 1
+                        if count % 100 == 0:
+                            print(f"Processed {count} new/updated images...")
         
         # Remove deleted files from index
         deleted_count = self._remove_deleted_files()
@@ -359,10 +467,11 @@ if __name__ == "__main__":
     directory = args['DIRECTORY']
     image = args['IMAGE']
     threshold = int(args['--threshold'])
-    
+    pool_size = int(args['--pool-size'])
+
     # Create index with persistence
     index_file = os.path.join(directory, '.image_index.zip')
-    index = ImageHashIndex(index_file=index_file)
+    index = ImageHashIndex(index_file=index_file, pool_size=pool_size)
     
     # Load existing index if available
     index_loaded = index.load_index()
@@ -373,13 +482,16 @@ if __name__ == "__main__":
         if count > 0 or (index_loaded and index.bktree.size == 0):
             print(f"Processed {count} new/updated images")
             print(f"BK-tree size: {index.bktree.size} unique hashes")
-            
+            print(f"Hash mappings: {len(index.hash_to_files)} unique hashes")
+
             # Save index
             index.save_index()
         elif index_loaded:
             print("Index is up to date")
             print(f"BK-tree size: {index.bktree.size} unique hashes")
+            print(f"Hash mappings: {len(index.hash_to_files)} unique hashes")
         
+        # Always run duplicate detection after building/loading index
         if image:
             # Search for duplicates of a specific image
             if os.path.exists(image):
