@@ -298,39 +298,56 @@ class ImageFileHandler:
     def get_resized_dimensions(self, original_width, original_height):
         """
         Calculate resized dimensions based on short/long side constraints.
-        
+        Only resize if the source image dimension is bigger than the target dimension.
+
         Args:
             original_width: Original image width
             original_height: Original image height
-            
+
         Returns:
             Tuple of (new_width, new_height) or (original_width, original_height) if no resize
         """
         if not self.short_side and not self.long_side:
             return original_width, original_height
-        
+
         aspect_ratio = original_width / original_height
-        
+
         if self.short_side:
             # Resize based on short side
             if original_width < original_height:
                 # Width is short side
-                new_width = self.short_side
-                new_height = int(new_width / aspect_ratio)
+                if original_width > self.short_side:
+                    new_width = self.short_side
+                    new_height = int(new_width / aspect_ratio)
+                else:
+                    # Don't upscale - keep original dimensions
+                    return original_width, original_height
             else:
                 # Height is short side
-                new_height = self.short_side
-                new_width = int(new_height * aspect_ratio)
+                if original_height > self.short_side:
+                    new_height = self.short_side
+                    new_width = int(new_height * aspect_ratio)
+                else:
+                    # Don't upscale - keep original dimensions
+                    return original_width, original_height
         else:  # self.long_side
             # Resize based on long side
             if original_width > original_height:
                 # Width is long side
-                new_width = self.long_side
-                new_height = int(new_width / aspect_ratio)
+                if original_width > self.long_side:
+                    new_width = self.long_side
+                    new_height = int(new_width / aspect_ratio)
+                else:
+                    # Don't upscale - keep original dimensions
+                    return original_width, original_height
             else:
                 # Height is long side
-                new_height = self.long_side
-                new_width = int(new_height * aspect_ratio)
+                if original_height > self.long_side:
+                    new_height = self.long_side
+                    new_width = int(new_height * aspect_ratio)
+                else:
+                    # Don't upscale - keep original dimensions
+                    return original_width, original_height
         
         return new_width, new_height
     
@@ -367,7 +384,8 @@ class ImageFileHandler:
             new_dims = (new_width, new_height)
             
             # Resize if needed
-            if new_width != original_width or new_height != original_height:
+            dimensions_changed = new_width != original_width or new_height != original_height
+            if dimensions_changed:
                 image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
             
             # Convert format if specified
@@ -395,7 +413,10 @@ class ImageFileHandler:
                     save_kwargs['exif'] = exif_data
             
             # Check if conversion is worthwhile
-            original_format = image.format or os.path.splitext(filepath)[1][1:].lower()
+            original_format = image.format or os.path.splitext(filepath)[1][1:]
+            original_format = original_format.lower()
+            if original_format in ('jpg', 'jpeg') and self.convert_format in ('jpg', 'jpeg'):
+                original_format = self.convert_format
             
             # Save to temporary location first to check size (with unique UID to avoid collisions)
             temp_uid = str(uuid.uuid4())[:8]
@@ -408,10 +429,10 @@ class ImageFileHandler:
             
             # Check if we should copy original instead
             format_changed = original_format.lower() != self.convert_format.lower()
-            if not format_changed and original_size > 0:
+            if not format_changed and not dimensions_changed and original_size > 0:
                 size_reduction = (original_size - new_size) / original_size
                 if size_reduction < 0.10:  # Less than 10% smaller
-                    # Copy original instead (don't delete source)
+                    # Copy original instead
                     shutil.copy2(filepath, final_output_path)
                     os.remove(temp_path)
                     return True, original_size, False, True, original_dims, original_dims, final_output_path
