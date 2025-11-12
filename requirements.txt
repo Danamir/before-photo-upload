@@ -1,0 +1,4 @@
+imagehash
+pillow
+pillow-heif
+docopt
